@@ -26,6 +26,8 @@
 #include <string.h>
 #include "lvx_file.h"
 #include "cmdline.h"
+#include <stdio.h>
+#include <time.h>
 
 DeviceItem devices[kMaxLidarCount];
 LvxFileHandle lvx_file_handler;
@@ -39,6 +41,8 @@ int lvx_file_save_time = 10;
 bool is_finish_extrinsic_parameter = false;
 bool is_read_extrinsic_from_xml = false;
 uint8_t connected_lidar_count = 0;
+PointCloudReturnMode g_return_mode = kTripleReturn;
+LidarScanPattern g_scan_pattern = kNoneRepetitiveScanPattern;
 
 #define FRAME_RATE 20
 
@@ -49,7 +53,8 @@ std::vector<std::string> broadcast_code_list = {
   //"000000000000001"
   //"000000000000002",
   //"000000000000003",
-  //"000000000000004"
+  //"000000000000004",
+  "3JEDN5K001JF711"
 };
 
 /** Receiving error message from Livox Lidar. */
@@ -98,6 +103,67 @@ void OnSampleCallback(livox_status status, uint8_t handle, uint8_t response, voi
     devices[handle].device_state = kDeviceStateConnect;
   }
 }
+
+/** Callback function of setting return mode. */
+void OnSetReturnMode(livox_status status, uint8_t handle, uint8_t response, void *data) {
+  printf("OnSetReturnMode status %d handle %u response %u\n", status, handle, response);
+    printf("************************************************************\n");
+
+}
+
+/** Callback function of setting return mode. */
+void OnSetScanPattern(livox_status status, uint8_t handle, DeviceParameterResponse *response, void *client_data) {
+    if (status != kStatusNotSupported && response != NULL) {
+      printf("SCAN ==============> status=> %d || handle=> %u || response=> %u\n", status, handle, response->ret_code);
+
+      printf("\n");
+      printf("************************************************************\n");
+    } else {
+      printf("SCAN ==============> NOOOOOO soportado");
+    printf("************************************************************\n");
+    }
+}
+
+void OnGetImu(livox_status status, uint8_t handle, LidarGetImuPushFrequencyResponse *response, void *client_data) {
+  if (status == kStatusSuccess && response != NULL) {
+    printf("IMU ==============> status=> %d || handle=> %u || response=> %u\n", status, handle, response->freq);
+    printf("************************************************************\n");
+
+  } else {
+    printf("IMU ==============> NOOOOOO soportado");
+    printf("************************************************************\n");
+
+  }
+}
+
+void OnGetScan(livox_status status, uint8_t handle, GetDeviceParameterResponse *response, void *client_dataa) {
+    if (status != kStatusNotSupported && response != NULL) {
+      printf("SCAN ==============> status=> %d || handle=> %u || response=> %u\n", status, handle, response->kv.value);
+
+      // Imprimir datos básicos de respuesta
+      printf("Device Parameter Response:\n");
+      printf("  Return Code: %u\n", response->rsp.ret_code);
+      printf("  Error Param Key: %u\n", response->rsp.error_param_key);
+      printf("  Error Code: %u\n", response->rsp.error_code);
+
+      // Imprimir KeyValueParam (kv)
+      printf("  KeyValueParam:\n");
+      printf("    Key: %u\n", response->kv.key);
+      printf("    Length: %u\n", response->kv.length);
+
+      // Imprimir valor (array)
+      printf("    Value: ");
+      for (int i = 0; i < response->kv.length; i++) {
+        printf("%02X ", response->kv.value[i]);  // en hexadecimal
+      }
+      printf("\n");
+      printf("************************************************************\n");
+    } else {
+      printf("SCAN ==============> NOOOOOO soportado");
+    printf("************************************************************\n");
+    }
+}
+
 
 /** Callback function of stopping sampling. */
 void OnStopSampleCallback(livox_status status, uint8_t handle, uint8_t response, void *data) {
@@ -210,11 +276,25 @@ void OnDeviceInfoChange(const DeviceInfo *info, DeviceEvent type) {
     printf("Device feature %d\n", devices[handle].info.feature);
     SetErrorMessageCallback(handle, OnLidarErrorStatusCallback);
     if (devices[handle].info.state == kLidarStateNormal) {
+
+      // 👇 Enviar return-mode primero
+      LidarSetPointCloudReturnMode(handle, g_return_mode, OnSetReturnMode, nullptr);
+
+      // Set scan pattern
+      LidarSetScanPattern(handle, g_scan_pattern, OnSetScanPattern, nullptr);
+
+      // Get IMU uint8_t handle, LidarGetImuPushFrequencyCallback cb, void * data
+      // LidarGetImuPushFrequency(handle, OnGetImu, nullptr);
+
+      // Get pattern scan
+      // LidarGetScanPattern(handle, OnGetScan, nullptr);
+
       if (!is_read_extrinsic_from_xml) {
         LidarGetExtrinsicParameter(handle, OnGetLidarExtrinsicParameter, nullptr);
       } else {
         LidarGetExtrinsicFromXml(handle);
       }
+      
       LidarStartSampling(handle, OnSampleCallback, nullptr);
       devices[handle].device_state = kDeviceStateSampling;
     }
@@ -288,6 +368,12 @@ void SetProgramOption(int argc, const char *argv[]) {
   cmd.add("log", 'l', "Save the log file");
   cmd.add<int>("time", 't', "Time to save point cloud to the lvx file", false);
   cmd.add("param", 'p', "Get the extrinsic parameter from extrinsic.xml file");
+ 
+  // 👇 NUEVO: return-mode
+  cmd.add<int>("return-mode", 'r', "Set point cloud return mode (0:first, 1:strongest, 2:dual, 3:triple)", false);
+
+  cmd.add<int>("scan", 's', "Set point cloud scan pattern (0:nonRepetitive, 1:repetitive)", false);
+  
   cmd.add("help", 'h', "Show help");
   cmd.parse_check(argc, const_cast<char **>(argv));
   if (cmd.exist("code")) {
@@ -309,11 +395,56 @@ void SetProgramOption(int argc, const char *argv[]) {
     printf("Time to save point cloud to the lvx file:%d.\n", cmd.get<int>("time"));
     lvx_file_save_time = cmd.get<int>("time");
   }
+
+  // 👇 NUEVO: parsear return-mode
+if (cmd.exist("return-mode")) {
+    int mode_val = cmd.get<int>("return-mode");
+
+    switch (mode_val) {
+      case 0: g_return_mode = kFirstReturn; break;
+      case 1: g_return_mode = kStrongestReturn; break;
+      case 2: g_return_mode = kDualReturn; break;
+      case 3: g_return_mode = kTripleReturn; break;
+      default:
+        printf("Unknown return-mode %d, using strongest.\n", mode_val);
+        g_return_mode = kTripleReturn;
+        break;
+    }
+
+    printf("Selected return mode: %d\n", mode_val);
+  }
+
+    // 👇 NUEVO: parsear return-mode
+if (cmd.exist("scan")) {
+    int mode_val = cmd.get<int>("scan");
+
+    switch (mode_val) {
+      case 0: g_scan_pattern = kNoneRepetitiveScanPattern; break;
+      case 1: g_scan_pattern = kRepetitiveScanPattern; break;
+      default:
+        printf("Unknown scan pattern %d, using non repetetive.\n", mode_val);
+        g_scan_pattern = kNoneRepetitiveScanPattern;
+        break;
+    }
+
+    printf("Selected scan pattern: %d\n", mode_val);
+  }
+
   if (cmd.exist("param")) {
     printf("Get the extrinsic parameter from extrinsic.xml file.\n");
     is_read_extrinsic_from_xml = true;
   }
   return;
+}
+
+void print_system_time() {
+    time_t t = time(NULL);
+    struct tm *tm_info = localtime(&t);
+
+    char buffer[32];
+    strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", tm_info);
+
+    printf("Inicio a las ======================> %s.000\n", buffer);  // sin milisegundos exactos
 }
 
 int main(int argc, const char *argv[]) {
@@ -369,6 +500,7 @@ int main(int argc, const char *argv[]) {
   lvx_file_handler.InitLvxFileHeader();
 
   int i = 0;
+  print_system_time();
   steady_clock::time_point last_time = steady_clock::now();
   for (i = 0; i < lvx_file_save_time * FRAME_RATE; ++i) {
     std::list<LvxBasePackDetail> point_packet_list_temp;
@@ -383,10 +515,10 @@ int main(int argc, const char *argv[]) {
       break;
     }
 
-    printf("Finish save %d frame to lvx file.\n", i);
     lvx_file_handler.SaveFrameToLvxFile(point_packet_list_temp);
   }
 
+  printf("Closing File.\n");
   lvx_file_handler.CloseLvxFile();
 
   for (i = 0; i < kMaxLidarCount; ++i) {
