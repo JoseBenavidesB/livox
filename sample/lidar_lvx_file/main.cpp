@@ -29,6 +29,10 @@
 #include <stdio.h>
 #include <time.h>
 
+#include <iostream>
+#include <chrono>
+#include <iomanip>
+
 DeviceItem devices[kMaxLidarCount];
 LvxFileHandle lvx_file_handler;
 std::list<LvxBasePackDetail> point_packet_list;
@@ -438,14 +442,34 @@ if (cmd.exist("scan")) {
 }
 
 void print_system_time() {
-    time_t t = time(NULL);
-    struct tm *tm_info = localtime(&t);
+    // Obtener tiempo actual
+    auto now = std::chrono::system_clock::now();
 
-    char buffer[32];
-    strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", tm_info);
+    // Convertir a tiempo con precisión de segundos
+    std::time_t t = std::chrono::system_clock::to_time_t(now);
+    auto tm_info = *std::localtime(&t);
 
-    printf("Inicio a las ======================> %s.000\n", buffer);  // sin milisegundos exactos
+    // Calcular milisegundos (o microsegundos)
+    auto duration = now.time_since_epoch();
+    auto millis = std::chrono::duration_cast<std::chrono::milliseconds>(duration).count() % 1000;
+
+    // Imprimir con milisegundos
+    std::cout << "Inicio a las ======================> "
+              << std::put_time(&tm_info, "%Y-%m-%d %H:%M:%S")
+              << "." << std::setfill('0') << std::setw(3) << millis
+              << std::endl;
 }
+
+
+// void print_system_time() {
+//     time_t t = time(NULL);
+//     struct tm *tm_info = localtime(&t);
+
+//     char buffer[32];
+//     strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", tm_info);
+
+//     printf("Inicio a las ======================> %s.000\n", buffer);  // sin milisegundos exactos
+// }
 
 int main(int argc, const char *argv[]) {
 /** Set the program options. */
