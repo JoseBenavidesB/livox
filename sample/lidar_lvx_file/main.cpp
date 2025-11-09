@@ -99,7 +99,6 @@ void GetLidarData(uint8_t handle, LivoxEthPacket *data, uint32_t data_num, void 
       packet.device_index = handle;
       lvx_file_handler.BasePointsHandle(data, packet);
       point_packet_list.push_back(packet);
-      point_pack_condition.notify_one();
     }
   }
 }
