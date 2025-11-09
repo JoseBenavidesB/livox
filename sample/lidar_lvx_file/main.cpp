@@ -562,13 +562,12 @@ static void loop() {
     // Abrir CSV (append)
     {
       std::lock_guard<std::mutex> lk(g_log_mtx);
+      bool existed = file_exists_and_nonempty(cfg.csv_path);
       g_log.open(cfg.csv_path, std::ios::out | std::ios::app);
       if (!g_log.is_open()) {
         std::cerr << "[GPIO] No se pudo abrir " << cfg.csv_path << "\n";
         return;
       }
-      bool existed = file_exists_and_nonempty(cfg.csv_path);
-      g_log.open(cfg.csv_path, std::ios::out | std::ios::app);
       if (!existed) write_header_if_new(g_log);
     }
 
@@ -587,18 +586,20 @@ static void loop() {
       now_timespec(CLOCK_MONOTONIC_RAW, mono);
 
       const bool rising = (ev.event_type == gpiod::line_event::RISING_EDGE);
-      const timespec kern_ts = ev.timestamp;
+
+      const auto kern_ts = ev.timestamp;                  // chrono::nanoseconds
+      const uint64_t kern_ns = static_cast<uint64_t>(kern_ts.count());
 
       {
         std::lock_guard<std::mutex> lk(g_log_mtx);
         g_log << ++seq << ","
               << (rising ? "RISING" : "FALLING") << ","
-              << to_ns(kern_ts) << ","
+              << kern_ts << ","
               << iso_from_timespec(rt) << ","
               << to_ns(rt) << ","
               << to_ns(mono) << "\n";
         g_log.flush();
-      }
+      } 
     }
 
   } catch (const std::exception& e) {
