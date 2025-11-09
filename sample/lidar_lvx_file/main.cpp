@@ -594,7 +594,7 @@ static void loop() {
         std::lock_guard<std::mutex> lk(g_log_mtx);
         g_log << ++seq << ","
               << (rising ? "RISING" : "FALLING") << ","
-              << kern_ts << ","
+              << kern_ns << ","
               << iso_from_timespec(rt) << ","
               << to_ns(rt) << ","
               << to_ns(mono) << "\n";
