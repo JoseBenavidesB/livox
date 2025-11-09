@@ -33,6 +33,14 @@
 #include <chrono>
 #include <iomanip>
 
+// ===================== BEGIN GPIO (libgpiod) =====================
+#include <gpiod.hpp>
+#include <atomic>
+#include <thread>
+#include <fstream>
+#include <mutex>
+#include <sys/stat.h>
+
 DeviceItem devices[kMaxLidarCount];
 LvxFileHandle lvx_file_handler;
 std::list<LvxBasePackDetail> point_packet_list;
@@ -44,9 +52,12 @@ std::mutex mtx;
 int lvx_file_save_time = 10;
 bool is_finish_extrinsic_parameter = false;
 bool is_read_extrinsic_from_xml = false;
-uint8_t connected_lidar_count = 0;
+// uint8_t connected_lidar_count = 0;
 PointCloudReturnMode g_return_mode = kTripleReturn;
 LidarScanPattern g_scan_pattern = kNoneRepetitiveScanPattern;
+
+// detect
+uint8_t connected_lidar_count = 0;
 
 #define FRAME_RATE 20
 
@@ -54,10 +65,6 @@ using namespace std::chrono;
 
 /** Connect all the broadcast device in default and connect specific device when use program options or broadcast_code_list is not empty. */
 std::vector<std::string> broadcast_code_list = {
-  //"000000000000001"
-  //"000000000000002",
-  //"000000000000003",
-  //"000000000000004",
   "3JEDN5K001JF711"
 };
 
@@ -92,6 +99,7 @@ void GetLidarData(uint8_t handle, LivoxEthPacket *data, uint32_t data_num, void 
       packet.device_index = handle;
       lvx_file_handler.BasePointsHandle(data, packet);
       point_packet_list.push_back(packet);
+      point_pack_condition.notify_one();
     }
   }
 }
@@ -441,41 +449,194 @@ if (cmd.exist("scan")) {
   return;
 }
 
+// void print_system_time() {
+//     // Obtener tiempo actual
+//     auto now = std::chrono::system_clock::now();
+
+//     // Convertir a tiempo con precisión de segundos
+//     std::time_t t = std::chrono::system_clock::to_time_t(now);
+//     auto tm_info = *std::localtime(&t);
+
+//     // Calcular milisegundos (o microsegundos)
+//     auto duration = now.time_since_epoch();
+//     auto millis = std::chrono::duration_cast<std::chrono::milliseconds>(duration).count() % 1000;
+
+//     // Imprimir con milisegundos
+//     std::cout << "Inicio a las ======================> "
+//               << std::put_time(&tm_info, "%Y-%m-%d %H:%M:%S")
+//               << "." << std::setfill('0') << std::setw(3) << millis
+//               << std::endl;
+// }
+
 void print_system_time() {
-    // Obtener tiempo actual
-    auto now = std::chrono::system_clock::now();
+    using namespace std::chrono;
 
-    // Convertir a tiempo con precisión de segundos
-    std::time_t t = std::chrono::system_clock::to_time_t(now);
-    auto tm_info = *std::localtime(&t);
+    // Tiempo actual
+    auto now = system_clock::now();
 
-    // Calcular milisegundos (o microsegundos)
-    auto duration = now.time_since_epoch();
-    auto millis = std::chrono::duration_cast<std::chrono::milliseconds>(duration).count() % 1000;
+    // Convertir a time_t para obtener fecha y hora legible
+    auto time_t_now = system_clock::to_time_t(now);
+    auto local_time = *std::localtime(&time_t_now);
 
-    // Imprimir con milisegundos
-    std::cout << "Inicio a las ======================> "
-              << std::put_time(&tm_info, "%Y-%m-%d %H:%M:%S")
-              << "." << std::setfill('0') << std::setw(3) << millis
+    // Extraer milisegundos
+    auto duration_since_epoch = now.time_since_epoch();
+    auto millis = duration_cast<milliseconds>(duration_since_epoch) % 1000;
+
+    // Extraer nanosegundos
+    auto nanos = duration_cast<nanoseconds>(duration_since_epoch).count();
+
+    // Imprimir formato legible + timestamp en ns
+    std::cout << std::put_time(&local_time, "%Y-%m-%d %H:%M:%S")
+              << '.' << std::setfill('0') << std::setw(3) << millis.count()
+              << " | ns since epoch: " << nanos
               << std::endl;
 }
 
+// ===================== BEGIN GPIO (libgpiod) =====================
+namespace gpio_marker {
 
-// void print_system_time() {
-//     time_t t = time(NULL);
-//     struct tm *tm_info = localtime(&t);
+static std::atomic<bool> g_run{false};
+static std::thread g_thread;
+static std::ofstream g_log;
+static std::mutex g_log_mtx;
 
-//     char buffer[32];
-//     strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", tm_info);
+// Convierte timespec a ns
+inline uint64_t to_ns(const timespec& ts) {
+  return uint64_t(ts.tv_sec) * 1000000000ull + uint64_t(ts.tv_nsec);
+}
 
-//     printf("Inicio a las ======================> %s.000\n", buffer);  // sin milisegundos exactos
-// }
+// ISO legible con milisegundos usando CLOCK_REALTIME
+inline std::string iso_from_timespec(const timespec& ts_rt) {
+  std::time_t s = ts_rt.tv_sec;
+  std::tm tm{};
+  localtime_r(&s, &tm);
+  char buf[64];
+  std::snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d",
+                tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+                tm.tm_hour, tm.tm_min, tm.tm_sec);
+  int ms = ts_rt.tv_nsec / 1000000;
+  char out[80];
+  std::snprintf(out, sizeof(out), "%s.%03d", buf, ms);
+  return std::string(out);
+}
+
+inline void now_timespec(clockid_t clk, timespec& ts) {
+  clock_gettime(clk, &ts);
+}
+
+struct Config {
+  std::string chip = "/dev/gpiochip0"; // Verifica con: gpiodetect
+  unsigned line = 23;                   // BCM23 = pin físico 16
+  std::string csv_path = "/var/log/livox_markers.csv";
+  bool falling = false;                 // escuchamos ambos bordes
+};
+
+static Config cfg;
+
+static bool file_exists_and_nonempty(const std::string& p) {
+  struct stat st{};
+  return stat(p.c_str(), &st) == 0 && st.st_size > 0;
+}
+
+static void write_header_if_new(std::ofstream& ofs) {
+  // no escribir si ya existía con contenido
+  // (abre primero g_log, luego chequea tamaño real del archivo con stat)
+  // asumiendo que ya revisaste antes:
+  ofs << "seq,edge,kernel_ts_ns,realtime_iso,realtime_ns,monotonic_ns\n";
+  ofs.flush();
+}
+
+static void loop() {
+  uint64_t seq = 0;
+  try {
+    gpiod::chip chip(cfg.chip);
+    auto line = chip.get_line(cfg.line);
+
+    gpiod::line_request req;
+    req.consumer = "livox_marker";
+    req.request_type = gpiod::line_request::EVENT_BOTH_EDGES;
+    req.flags = gpiod::line_request::FLAG_BIAS_PULL_DOWN; // pull-down interno (si el SoC lo soporta)
+
+    line.request(req);
+
+    // Abrir CSV (append)
+    {
+      std::lock_guard<std::mutex> lk(g_log_mtx);
+      g_log.open(cfg.csv_path, std::ios::out | std::ios::app);
+      if (!g_log.is_open()) {
+        std::cerr << "[GPIO] No se pudo abrir " << cfg.csv_path << "\n";
+        return;
+      }
+      bool existed = file_exists_and_nonempty(cfg.csv_path);
+      g_log.open(cfg.csv_path, std::ios::out | std::ios::app);
+      if (!existed) write_header_if_new(g_log);
+    }
+
+    std::cerr << "[GPIO] Escuchando en " << cfg.chip << " línea " << cfg.line
+              << " -> log: " << cfg.csv_path << "\n";
+
+    while (g_run.load()) {
+      // espera con timeout
+      if (!line.event_wait(std::chrono::milliseconds(200))) {
+        continue; // timeout: reintenta y permite salida limpia
+      }
+      gpiod::line_event ev = line.event_read();
+
+      timespec rt{}, mono{};
+      now_timespec(CLOCK_REALTIME, rt);
+      now_timespec(CLOCK_MONOTONIC_RAW, mono);
+
+      const bool rising = (ev.event_type == gpiod::line_event::RISING_EDGE);
+      const timespec kern_ts = ev.timestamp;
+
+      {
+        std::lock_guard<std::mutex> lk(g_log_mtx);
+        g_log << ++seq << ","
+              << (rising ? "RISING" : "FALLING") << ","
+              << to_ns(kern_ts) << ","
+              << iso_from_timespec(rt) << ","
+              << to_ns(rt) << ","
+              << to_ns(mono) << "\n";
+        g_log.flush();
+      }
+    }
+
+  } catch (const std::exception& e) {
+    std::cerr << "[GPIO] Excepción: " << e.what() << "\n";
+  }
+}
+
+inline void start(const std::string& chip, unsigned line, const std::string& csv_path) {
+  cfg.chip = chip;
+  cfg.line = line;
+  cfg.csv_path = csv_path;
+  g_run.store(true);
+  g_thread = std::thread(loop);
+}
+
+inline void stop() {
+  g_run.store(false);
+  // Desbloquear event_read: una forma limpia es enviar un pulso externo; si no,
+  // deja que el proceso continúe hasta recibir el siguiente evento.
+  if (g_thread.joinable()) g_thread.join();
+  std::lock_guard<std::mutex> lk(g_log_mtx);
+  if (g_log.is_open()) g_log.close();
+}
+
+} // namespace gpio_marker
+// ===================== END GPIO (libgpiod) =====================
+
 
 int main(int argc, const char *argv[]) {
 /** Set the program options. */
   SetProgramOption(argc, argv);
 
-  printf("Livox SDK initializing.\n");
+  const std::string gpio_chip = "/dev/gpiochip0";
+  const unsigned gpio_line = 23; // BCM23
+  const std::string gpio_log_path = "/var/log/livox_markers.csv";
+  gpio_marker::start(gpio_chip, gpio_line, gpio_log_path);
+
+  // printf("Livox SDK initializing.\n");
 /** Initialize Livox-SDK. */
   if (!Init()) {
     return -1;
@@ -551,6 +712,10 @@ int main(int argc, const char *argv[]) {
       LidarStopSampling(devices[i].handle, OnStopSampleCallback, nullptr);
     }
   }
+
+  // ====== BEGIN GPIO STOP ======
+  gpio_marker::stop();
+  // ====== END GPIO STOP ======
 
 /** Uninitialize Livox-SDK. */
   Uninit();
