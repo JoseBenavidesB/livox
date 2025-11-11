@@ -33,18 +33,13 @@
 #include <chrono>
 #include <iomanip>
 
-// mavlink
+// ===================== BEGIN GPIO (libgpiod) =====================
+#include <gpiod.hpp>
 #include <atomic>
 #include <thread>
 #include <fstream>
-#include <unistd.h>
-#include <fcntl.h>
-#include <termios.h>
-
-// Si instalas los headers del sistema: sudo apt-get install -y libmavlink-dev
-// y usa:
-#include <mavlink/common/mavlink.h>  // MAVLink v2 common
-// end mavlink
+#include <mutex>
+#include <sys/stat.h>
 
 DeviceItem devices[kMaxLidarCount];
 LvxFileHandle lvx_file_handler;
@@ -63,17 +58,6 @@ LidarScanPattern g_scan_pattern = kNoneRepetitiveScanPattern;
 
 // detect
 uint8_t connected_lidar_count = 0;
-
-// mavlink
-std::string g_mav_port = "/dev/ttyAMA1";
-int g_mav_baud = 115200;
-int g_mav_sysid = 245;
-int g_mav_compid = 190;
-std::string g_ts_log_path = "pi5_timesync.csv";
-
-std::atomic<bool> g_run_timesync{true};
-
-// end mavlink
 
 #define FRAME_RATE 20
 
@@ -310,6 +294,12 @@ void OnDeviceInfoChange(const DeviceInfo *info, DeviceEvent type) {
       // Set scan pattern
       LidarSetScanPattern(handle, g_scan_pattern, OnSetScanPattern, nullptr);
 
+      // Get IMU uint8_t handle, LidarGetImuPushFrequencyCallback cb, void * data
+      // LidarGetImuPushFrequency(handle, OnGetImu, nullptr);
+
+      // Get pattern scan
+      // LidarGetScanPattern(handle, OnGetScan, nullptr);
+
       if (!is_read_extrinsic_from_xml) {
         LidarGetExtrinsicParameter(handle, OnGetLidarExtrinsicParameter, nullptr);
       } else {
@@ -394,15 +384,6 @@ void SetProgramOption(int argc, const char *argv[]) {
   cmd.add<int>("return-mode", 'r', "Set point cloud return mode (0:first, 1:strongest, 2:dual, 3:triple)", false);
 
   cmd.add<int>("scan", 's', "Set point cloud scan pattern (0:nonRepetitive, 1:repetitive)", false);
-
-  // Mavlink
-  cmd.add<std::string>("mav-port", 0, "Serial port to Cube (e.g. /dev/ttyAMA1 or /dev/ttyS0)", false, "/dev/ttyAMA1");
-  cmd.add<int>("mav-baud", 0, "Baudrate for serial MAVLink (e.g. 115200 or 921600)", false, 115200);
-  cmd.add<int>("mav-sysid", 0, "MAVLink system id for PI5", false, 245);
-  cmd.add<int>("mav-compid", 0, "MAVLink component id for PI5", false, 190);
-  cmd.add<std::string>("ts-log", 0, "Path for local timestamp log", false, "pi5_timesync.csv");
-  // end mavlink
-
   
   cmd.add("help", 'h', "Show help");
   cmd.parse_check(argc, const_cast<char **>(argv));
@@ -427,7 +408,7 @@ void SetProgramOption(int argc, const char *argv[]) {
   }
 
   // 👇 NUEVO: parsear return-mode
-  if (cmd.exist("return-mode")) {
+if (cmd.exist("return-mode")) {
     int mode_val = cmd.get<int>("return-mode");
 
     switch (mode_val) {
@@ -445,7 +426,7 @@ void SetProgramOption(int argc, const char *argv[]) {
   }
 
     // 👇 NUEVO: parsear return-mode
-  if (cmd.exist("scan")) {
+if (cmd.exist("scan")) {
     int mode_val = cmd.get<int>("scan");
 
     switch (mode_val) {
@@ -464,15 +445,27 @@ void SetProgramOption(int argc, const char *argv[]) {
     printf("Get the extrinsic parameter from extrinsic.xml file.\n");
     is_read_extrinsic_from_xml = true;
   }
-  
-  if (cmd.exist("mav-port")) g_mav_port = cmd.get<std::string>("mav-port");
-  if (cmd.exist("mav-baud")) g_mav_baud = cmd.get<int>("mav-baud");
-  if (cmd.exist("mav-sysid")) g_mav_sysid = cmd.get<int>("mav-sysid");
-  if (cmd.exist("mav-compid")) g_mav_compid = cmd.get<int>("mav-compid");
-  if (cmd.exist("ts-log")) g_ts_log_path = cmd.get<std::string>("ts-log");
-  
   return;
 }
+
+// void print_system_time() {
+//     // Obtener tiempo actual
+//     auto now = std::chrono::system_clock::now();
+
+//     // Convertir a tiempo con precisión de segundos
+//     std::time_t t = std::chrono::system_clock::to_time_t(now);
+//     auto tm_info = *std::localtime(&t);
+
+//     // Calcular milisegundos (o microsegundos)
+//     auto duration = now.time_since_epoch();
+//     auto millis = std::chrono::duration_cast<std::chrono::milliseconds>(duration).count() % 1000;
+
+//     // Imprimir con milisegundos
+//     std::cout << "Inicio a las ======================> "
+//               << std::put_time(&tm_info, "%Y-%m-%d %H:%M:%S")
+//               << "." << std::setfill('0') << std::setw(3) << millis
+//               << std::endl;
+// }
 
 void print_system_time() {
     using namespace std::chrono;
@@ -498,133 +491,152 @@ void print_system_time() {
               << std::endl;
 }
 
+// ===================== BEGIN GPIO (libgpiod) =====================
+namespace gpio_marker {
 
-// Mavlink
-int open_serial_port(const std::string& port, int baud) {
-  int fd = ::open(port.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK);
-  if (fd < 0) return -1;
+static std::atomic<bool> g_run{false};
+static std::thread g_thread;
+static std::ofstream g_log;
+static std::mutex g_log_mtx;
 
-  termios tty{};
-  if (tcgetattr(fd, &tty) != 0) { close(fd); return -1; }
-
-  cfmakeraw(&tty);
-
-  speed_t br = B115200;
-  switch (baud) {
-    case 57600: br = B57600; break;
-    case 115200: br = B115200; break;
-    case 230400: br = B230400; break;
-    case 460800: br = B460800; break;
-    case 921600: br = B921600; break;
-    default: br = B115200; break;
-  }
-  cfsetispeed(&tty, br);
-  cfsetospeed(&tty, br);
-
-  tty.c_cflag |= (CLOCAL | CREAD);
-  tty.c_cflag &= ~CSTOPB;        // 1 stop bit
-  tty.c_cflag &= ~PARENB;        // no parity
-  tty.c_cflag &= ~CRTSCTS;       // no HW flow
-
-  tty.c_cc[VTIME] = 0;
-  tty.c_cc[VMIN]  = 0;
-
-  if (tcsetattr(fd, TCSANOW, &tty) != 0) { close(fd); return -1; }
-
-  // pasar a blocking write
-  int flags = fcntl(fd, F_GETFL, 0);
-  fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
-
-  return fd;
+// Convierte timespec a ns
+inline uint64_t to_ns(const timespec& ts) {
+  return uint64_t(ts.tv_sec) * 1000000000ull + uint64_t(ts.tv_nsec);
 }
 
-bool mav_write_msg(int fd, const mavlink_message_t& msg) {
-  uint8_t buffer[MAVLINK_MAX_PACKET_LEN];
-  const uint16_t len = mavlink_msg_to_send_buffer(buffer, &msg);
-  ssize_t w = ::write(fd, buffer, len);
-  return (w == (ssize_t)len);
+// ISO legible con milisegundos usando CLOCK_REALTIME
+inline std::string iso_from_timespec(const timespec& ts_rt) {
+  std::time_t s = ts_rt.tv_sec;
+  std::tm tm{};
+  localtime_r(&s, &tm);
+  char buf[64];
+  std::snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d",
+                tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+                tm.tm_hour, tm.tm_min, tm.tm_sec);
+  int ms = ts_rt.tv_nsec / 1000000;
+  char out[80];
+  std::snprintf(out, sizeof(out), "%s.%03d", buf, ms);
+  return std::string(out);
 }
 
-void send_system_time(int fd, uint8_t sysid, uint8_t compid, int64_t ns) {
-  mavlink_message_t msg{};
-  const uint64_t usec = (uint64_t)(ns / 1000);
-  const uint32_t boot_ms = (uint32_t)(std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::steady_clock::now().time_since_epoch()).count() & 0xFFFFFFFFu);
-  mavlink_msg_system_time_pack(sysid, compid, &msg, usec, boot_ms);
-  mav_write_msg(fd, msg);
+inline void now_timespec(clockid_t clk, timespec& ts) {
+  clock_gettime(clk, &ts);
 }
 
-void send_timesync(int fd, uint8_t sysid, uint8_t compid, int64_t ns_pi5) {
-  // En el "handshake" clásico, el companion manda tc1=0, ts1=local.
-  // Aquí queremos LOG estructurado con ns, por lo que:
-  //   tc1 = 0 (solicitud), ts1 = ns del PI5
-  mavlink_message_t msg{};
-  mavlink_msg_timesync_pack(sysid, compid, &msg, 0 /*tc1*/, ns_pi5 /*ts1*/);
-  mav_write_msg(fd, msg);
+struct Config {
+  std::string chip = "/dev/gpiochip0"; // Verifica con: gpiodetect
+  unsigned line = 23;                   // BCM23 = pin físico 16
+  std::string csv_path = "/var/log/livox_markers.csv";
+  bool falling = false;                 // escuchamos ambos bordes
+};
+
+static Config cfg;
+
+static bool file_exists_and_nonempty(const std::string& p) {
+  struct stat st{};
+  return stat(p.c_str(), &st) == 0 && st.st_size > 0;
 }
 
-void send_statustext_ns(int fd, uint8_t sysid, uint8_t compid, int64_t ns) {
-  mavlink_message_t msg{};
-  char txt[50];
-  snprintf(txt, sizeof(txt), "PI5_NS=%lld", (long long)ns);
-  mavlink_msg_statustext_pack(sysid, compid, &msg, MAV_SEVERITY_INFO, txt, 0, 0);
-  mav_write_msg(fd, msg);
+static void write_header_if_new(std::ofstream& ofs) {
+  // no escribir si ya existía con contenido
+  // (abre primero g_log, luego chequea tamaño real del archivo con stat)
+  // asumiendo que ya revisaste antes:
+  ofs << "seq,edge,kernel_ts_ns,realtime_iso,realtime_ns,monotonic_ns\n";
+  ofs.flush();
 }
 
-void timesync_worker() {
-  // Abrir puerto
-  const int fd = open_serial_port(g_mav_port, g_mav_baud);
-  if (fd < 0) {
-    fprintf(stderr, "[Timesync] ERROR: no pude abrir %s @ %d\n", g_mav_port.c_str(), g_mav_baud);
-    return;
-  }
+static void loop() {
+  uint64_t seq = 0;
+  try {
+    gpiod::chip chip(cfg.chip);
+    auto line = chip.get_line(cfg.line);
 
-  // Abrir/crear log CSV y escribir encabezado si está vacío
-  std::ofstream ofs;
-  ofs.open(g_ts_log_path, std::ios::out | std::ios::app);
-  if (!ofs) {
-    fprintf(stderr, "[Timesync] WARNING: no pude abrir log %s\n", g_ts_log_path.c_str());
-  } else if (ofs.tellp() == 0) {
-    ofs << "unix_time_ns\n";
-    ofs.flush();
-  }
+    gpiod::line_request req;
+    req.consumer = "livox_marker";
+    req.request_type = gpiod::line_request::EVENT_BOTH_EDGES;
+    req.flags = gpiod::line_request::FLAG_BIAS_PULL_DOWN; // pull-down interno (si el SoC lo soporta)
 
-  // Programar “cada 60 s” relativo al inicio (estable y sin drift perceptible)
-  auto t0 = std::chrono::steady_clock::now();
-  int n = 0;
+    line.request(req);
 
-  while (g_run_timesync.load()) {
-    auto target = t0 + std::chrono::seconds(60 * n);
-    std::this_thread::sleep_until(target);
-
-    // Timestamp ns (CLOCK_REALTIME ~ epoch)
-    int64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                   std::chrono::system_clock::now().time_since_epoch()).count();
-
-    // 1) Log local
-    if (ofs) {
-      ofs << ns << "\n";
-      ofs.flush();
+    // Abrir CSV (append)
+    {
+      std::lock_guard<std::mutex> lk(g_log_mtx);
+      bool existed = file_exists_and_nonempty(cfg.csv_path);
+      g_log.open(cfg.csv_path, std::ios::out | std::ios::app);
+      if (!g_log.is_open()) {
+        std::cerr << "[GPIO] No se pudo abrir " << cfg.csv_path << "\n";
+        return;
+      }
+      if (!existed) write_header_if_new(g_log);
     }
 
-    // 2) Envío MAVLink inmediato
-    send_system_time(fd, (uint8_t)g_mav_sysid, (uint8_t)g_mav_compid, ns);
-    send_timesync(fd,    (uint8_t)g_mav_sysid, (uint8_t)g_mav_compid, ns);
-    send_statustext_ns(fd,(uint8_t)g_mav_sysid, (uint8_t)g_mav_compid, ns);
+    std::cerr << "[GPIO] Escuchando en " << cfg.chip << " línea " << cfg.line
+              << " -> log: " << cfg.csv_path << "\n";
 
-    ++n;
+    while (g_run.load()) {
+      // espera con timeout
+      if (!line.event_wait(std::chrono::milliseconds(200))) {
+        continue; // timeout: reintenta y permite salida limpia
+      }
+      gpiod::line_event ev = line.event_read();
+
+      timespec rt{}, mono{};
+      now_timespec(CLOCK_REALTIME, rt);
+      now_timespec(CLOCK_MONOTONIC_RAW, mono);
+
+      const bool rising = (ev.event_type == gpiod::line_event::RISING_EDGE);
+
+      const auto kern_ts = ev.timestamp;                  // chrono::nanoseconds
+      const uint64_t kern_ns = static_cast<uint64_t>(kern_ts.count());
+
+      {
+        std::lock_guard<std::mutex> lk(g_log_mtx);
+        g_log << ++seq << ","
+              << (rising ? "RISING" : "FALLING") << ","
+              << kern_ns << ","
+              << iso_from_timespec(rt) << ","
+              << to_ns(rt) << ","
+              << to_ns(mono) << "\n";
+        g_log.flush();
+      } 
+    }
+
+  } catch (const std::exception& e) {
+    std::cerr << "[GPIO] Excepción: " << e.what() << "\n";
   }
-
-  if (ofs) ofs.close();
-  ::close(fd);
 }
 
-// End Mavlink
+inline void start(const std::string& chip, unsigned line, const std::string& csv_path) {
+  cfg.chip = chip;
+  cfg.line = line;
+  cfg.csv_path = csv_path;
+  g_run.store(true);
+  g_thread = std::thread(loop);
+}
+
+inline void stop() {
+  g_run.store(false);
+  // Desbloquear event_read: una forma limpia es enviar un pulso externo; si no,
+  // deja que el proceso continúe hasta recibir el siguiente evento.
+  if (g_thread.joinable()) g_thread.join();
+  std::lock_guard<std::mutex> lk(g_log_mtx);
+  if (g_log.is_open()) g_log.close();
+}
+
+} // namespace gpio_marker
+// ===================== END GPIO (libgpiod) =====================
+
 
 int main(int argc, const char *argv[]) {
 /** Set the program options. */
   SetProgramOption(argc, argv);
 
+  const std::string gpio_chip = "/dev/gpiochip0";
+  const unsigned gpio_line = 23; // BCM23
+  const std::string gpio_log_path = "/var/log/livox_markers.csv";
+  gpio_marker::start(gpio_chip, gpio_line, gpio_log_path);
+
+  // printf("Livox SDK initializing.\n");
 /** Initialize Livox-SDK. */
   if (!Init()) {
     return -1;
@@ -640,7 +652,9 @@ int main(int argc, const char *argv[]) {
 /** Set the callback function receiving broadcast message from Livox LiDAR. */
   SetBroadcastCallback(OnDeviceBroadcast);
 
-/** Set the callback function called when device state change */
+/** Set the callback function called when device state change,
+ * which means connection/disconnection and changing of LiDAR state.
+ */
   SetDeviceStateUpdateCallback(OnDeviceInfoChange);
 
 /** Start the device discovering routine. */
@@ -669,11 +683,6 @@ int main(int argc, const char *argv[]) {
   }
 
   lvx_file_handler.InitLvxFileHeader();
-
-  // mavlink
-  // Lanzar hilo de timesync (log + MAVLink por minuto)
-  std::thread ts_thread(timesync_worker);
-  // end mavlink
 
   int i = 0;
   print_system_time();
@@ -704,11 +713,10 @@ int main(int argc, const char *argv[]) {
     }
   }
 
-  // mavlink
-  g_run_timesync.store(false);
-  if (ts_thread.joinable()) ts_thread.join();
-  // end mavlink
+  // ====== BEGIN GPIO STOP ======
+  gpio_marker::stop();
+  // ====== END GPIO STOP ======
 
-  /** Uninitialize Livox-SDK. */
+/** Uninitialize Livox-SDK. */
   Uninit();
 }
